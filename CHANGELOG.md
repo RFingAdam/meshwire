@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reconnects to Blender back off.** When a connection is refused or times out, the next attempt
+  waits. The wait starts at 0.25 seconds, doubles on each failure up to 8 seconds, and is scaled by
+  a random factor from a half to one, so a stopped Blender is not contacted on every call. The error
+  says how long the next attempt will wait.
+- **A call already sent is not sent again when the socket drops.** The error says the call may
+  already have run in Blender and was not retried. Commands that change the scene are never retried
+  automatically. The following call connects again, including after Blender restarts on another port.
+
 ## [0.5.0] - 2026-11-06
 
 ### Security

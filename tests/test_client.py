@@ -7,11 +7,14 @@ import sys
 
 import pytest
 
-from mcp_blender import wire
+from mcp_blender import blender_client, wire
 from mcp_blender.blender_client import (
+    RECONNECT_BASE_SECONDS,
+    RECONNECT_CAP_SECONDS,
     BlenderClient,
     BlenderCommandError,
     BlenderConnectionError,
+    reconnect_delay,
 )
 
 # What a v0.4.0 add-on really sends for a method it does not know: its dispatcher
@@ -63,6 +66,8 @@ class MockBlenderServer:
         self.hellos: list[dict] = []
         self.proofs: list[dict] = []
         self.commands: list[dict] = []
+        self.close_after: set[str] = set()  # drop the socket after receiving these methods
+        self._client_writers: list[asyncio.StreamWriter] = []
 
     async def start(self):
         """Start the mock server."""
@@ -85,11 +90,21 @@ class MockBlenderServer:
         """Set a mock response for a method."""
         self._responses[method] = result
 
+    async def drop_clients(self) -> None:
+        """Close every accepted connection, the way a quitting Blender does."""
+        for writer in list(self._client_writers):
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a client connection."""
         buffer = b""
         nonce_c = nonce_s = ""
         seen = wire.endpoint(*writer.get_extra_info("sockname")[:2])
+        self._client_writers.append(writer)
         try:
             while True:
                 data = await reader.read(65536)
@@ -130,6 +145,9 @@ class MockBlenderServer:
                         response.update({"error": error} if error else {"result": {"ok": True}})
                     else:
                         self.commands.append(request)
+                        if method in self.close_after:
+                            writer.close()
+                            return
                         response = self._process_request(request)
                     writer.write((json.dumps(response) + "\n").encode("utf-8"))
                     await writer.drain()
@@ -1012,3 +1030,188 @@ async def test_unparseable_handshake_reply_gets_the_fixed_text(payload):
     assert str(info.value) == (
         f"The program on 127.0.0.1:{raw.port} did not complete the Meshwire handshake."
     )
+
+
+# --- reconnect backoff and dropped calls --------------------------------------
+
+
+def _seconds(value: float) -> str:
+    """The same rendering the client uses in its reconnect error."""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def test_reconnect_delay_doubles_with_jitter_until_the_cap():
+    """Each failure waits twice as long, jitter scales it, and the cap is the ceiling."""
+    assert reconnect_delay(1, 1.0) == RECONNECT_BASE_SECONDS
+    assert reconnect_delay(1, 0.5) == RECONNECT_BASE_SECONDS * 0.5
+    assert reconnect_delay(2, 1.0) == RECONNECT_BASE_SECONDS * 2
+    third_low = reconnect_delay(3, 0.5)
+    third_high = reconnect_delay(3, 1.0)
+    assert third_low == RECONNECT_BASE_SECONDS * 4 * 0.5
+    assert third_low < third_high <= RECONNECT_CAP_SECONDS
+    assert reconnect_delay(10_000, 1.0) == RECONNECT_CAP_SECONDS
+    assert reconnect_delay(10_000, 0.5) == RECONNECT_CAP_SECONDS
+    with pytest.raises(ValueError):
+        reconnect_delay(0, 1.0)
+    with pytest.raises(ValueError):
+        reconnect_delay(1, 0.49)
+
+
+def _frozen_clock(monkeypatch):
+    """A clock and a pause that do not really sleep. Returns the pauses taken."""
+    clock = {"t": 1_000.0}
+    pauses: list[float] = []
+
+    def now() -> float:
+        return clock["t"]
+
+    async def pause(seconds: float) -> None:
+        pauses.append(seconds)
+        clock["t"] += seconds
+
+    monkeypatch.setattr(blender_client, "_now", now)
+    monkeypatch.setattr(blender_client, "_pause", pause)
+    return pauses
+
+
+@pytest.mark.asyncio
+async def test_reconnect_after_a_refusal_waits_and_says_how_long(monkeypatch):
+    """A stopped Blender is not dialled again until a jittered, capped delay has elapsed."""
+    pauses = _frozen_clock(monkeypatch)
+    monkeypatch.setattr(blender_client, "_jitter_factor", lambda: 1.0)
+    client = BlenderClient("127.0.0.1", 59999)
+
+    with pytest.raises(BlenderConnectionError) as first:
+        await client.connect(timeout=1.0)
+    assert pauses == []
+    first_delay = reconnect_delay(1, 1.0)
+    assert f"wait {_seconds(first_delay)} s" in str(first.value)
+    assert "stopped Blender" in str(first.value)
+    assert "Meshwire tab" in str(first.value)
+    assert "may already have run" not in str(first.value)
+
+    with pytest.raises(BlenderConnectionError):
+        await client.connect(timeout=1.0)
+    assert pauses == [first_delay]
+
+    for _ in range(12):
+        with pytest.raises(BlenderConnectionError):
+            await client.connect(timeout=1.0)
+    assert pauses[-1] == RECONNECT_CAP_SECONDS
+    assert all(later >= earlier for earlier, later in zip(pauses, pauses[1:]))
+    assert max(pauses) == RECONNECT_CAP_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_jitter_changes_the_reconnect_wait(monkeypatch):
+    pauses = _frozen_clock(monkeypatch)
+    monkeypatch.setattr(blender_client, "_jitter_factor", lambda: 0.5)
+    client = BlenderClient("127.0.0.1", 59999)
+    with pytest.raises(BlenderConnectionError):
+        await client.connect(timeout=1.0)
+    with pytest.raises(BlenderConnectionError) as info:
+        await client.connect(timeout=1.0)
+    assert pauses == [reconnect_delay(1, 0.5)]
+    # The error from this attempt says how long the following one will wait.
+    assert f"wait {_seconds(reconnect_delay(2, 0.5))} s" in str(info.value)
+
+
+@pytest.mark.asyncio
+async def test_a_successful_connect_clears_the_reconnect_backoff(mock_server, monkeypatch):
+    """Once Blender answers, the next failure starts the wait over at the base delay."""
+    pauses = _frozen_clock(monkeypatch)
+    monkeypatch.setattr(blender_client, "_jitter_factor", lambda: 1.0)
+    client = BlenderClient("127.0.0.1", 59999)
+    with pytest.raises(BlenderConnectionError):
+        await client.connect(timeout=1.0)
+    with pytest.raises(BlenderConnectionError):
+        await client.connect(timeout=1.0)
+    assert pauses == [RECONNECT_BASE_SECONDS]
+
+    client._fixed_port = mock_server.port
+    await client.connect(timeout=2.0)
+    assert client.connected
+    # The successful open waited out the delay armed by the second failure, then cleared it.
+    assert pauses == [RECONNECT_BASE_SECONDS, RECONNECT_BASE_SECONDS * 2]
+    await client.disconnect()
+
+    client._fixed_port = 59999
+    with pytest.raises(BlenderConnectionError):
+        await client.connect(timeout=1.0)
+    assert pauses == [RECONNECT_BASE_SECONDS, RECONNECT_BASE_SECONDS * 2]
+    with pytest.raises(BlenderConnectionError):
+        await client.connect(timeout=1.0)
+    assert pauses[-1] == RECONNECT_BASE_SECONDS
+
+
+def _running_instance(port: int, started: float) -> dict:
+    return {
+        "probe": "live",
+        "port": port,
+        "host": "127.0.0.1",
+        "pid": os.getpid(),
+        "protocol": wire.PROTOCOL,
+        "addon": "0.5.0",
+        "blender": "4.5.15",
+        "blend": "/tmp/restart.blend",
+        "started": started,
+    }
+
+
+@pytest.mark.asyncio
+async def test_blender_restarting_mid_session_is_used_on_the_next_call(monkeypatch):
+    """Blender quits and comes back on another port; the next call uses the new one.
+
+    The call that was already answered is not sent again.
+    """
+    first = await MockBlenderServer().start()
+    second = await MockBlenderServer().start()
+    which = {"port": first.port}
+
+    def instances():
+        return [_running_instance(which["port"], 2.0 if which["port"] == second.port else 1.0)]
+
+    monkeypatch.setattr(wire, "live_instances", instances)
+    client = BlenderClient("127.0.0.1", None)
+    try:
+        assert (await client.send_command("ping"))["pong"] is True
+        assert client.port == first.port
+        await first.drop_clients()
+        deadline = asyncio.get_running_loop().time() + 2
+        while client.connected and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert not client.connected
+
+        which["port"] = second.port
+        second.set_response("scene_info", {"name": "AfterRestart"})
+        result = await asyncio.wait_for(client.send_command("scene_info"), timeout=2)
+        assert result["name"] == "AfterRestart"
+        assert client.port == second.port
+        assert [command["method"] for command in second.commands] == ["scene_info"]
+        assert [command["method"] for command in first.commands] == ["ping"]
+    finally:
+        await client.disconnect()
+        await first.stop()
+        await second.stop()
+
+
+@pytest.mark.asyncio
+async def test_call_in_flight_when_the_socket_drops_is_not_retried(mock_server):
+    """A scene change already handed to Blender is not sent again after the socket drops."""
+    mock_server.close_after.add("object_create")
+    client = BlenderClient(mock_server.host, mock_server.port)
+    try:
+        with pytest.raises(BlenderConnectionError) as info:
+            await asyncio.wait_for(
+                client.send_command("object_create", {"name": "Cube"}),
+                timeout=2,
+            )
+    finally:
+        await client.disconnect()
+
+    message = str(info.value)
+    assert "object_create" in message
+    assert "may already have run in Blender" in message
+    assert "was not retried" in message
+    assert [command["method"] for command in mock_server.commands] == ["object_create"]
+    assert mock_server.commands[0]["params"] == {"name": "Cube"}

@@ -5,7 +5,9 @@ import hmac
 import json
 import logging
 import os
+import random
 import socket
+import time
 import uuid
 from typing import Any
 
@@ -18,11 +20,79 @@ MAX_REPLY_LINE = 256 * 1024 * 1024 + 1024 * 1024
 READ_SIZE = 1024 * 1024
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
+# After a refused or timed-out connect, the next attempt waits. The wait doubles
+# from the base and never exceeds the cap. A factor in [0.5, 1] spreads retries
+# that would otherwise land together, and keeps the wait from being zero.
+RECONNECT_BASE_SECONDS = 0.25
+RECONNECT_CAP_SECONDS = 8.0
+RECONNECT_FACTOR = 2.0
+
+
+def reconnect_delay(failed_attempts: int, jitter: float) -> float:
+    """Seconds to wait before another reconnect after ``failed_attempts`` failures.
+
+    The first failure waits ``RECONNECT_BASE_SECONDS`` scaled by ``jitter``. Each
+    further failure doubles that. ``jitter`` is from 0.5 to 1, so the wait is never
+    zero and two clients that fail together do not retry together. The result never
+    exceeds ``RECONNECT_CAP_SECONDS``.
+    """
+    if failed_attempts < 1:
+        raise ValueError("failed_attempts starts at 1")
+    if not 0.5 <= jitter <= 1.0:
+        raise ValueError("jitter must be from 0.5 to 1")
+    # 0.25 * 2**32 already dwarfs the cap. Capping the exponent keeps a long outage
+    # from building an enormous integer.
+    exponent = min(failed_attempts - 1, 32)
+    grown = RECONNECT_BASE_SECONDS * (RECONNECT_FACTOR**exponent)
+    return min(RECONNECT_CAP_SECONDS, grown * jitter)
+
+
+def _seconds(value: float) -> str:
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+async def _pause(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+def _jitter_factor() -> float:
+    """A scale in [0.5, 1] applied to a reconnect delay."""
+    return random.uniform(0.5, 1.0)
+
+
+def _backoff_notice(exc: BaseException, delay: float) -> str:
+    return (
+        f"{exc}\n"
+        f"The next reconnect will wait {_seconds(delay)} s before trying again "
+        f"(the wait doubles, up to {_seconds(RECONNECT_CAP_SECONDS)} s, and includes jitter) "
+        "so a stopped Blender is not contacted on every call. "
+        "Start the server in Blender's Meshwire tab if it is not running."
+    )
+
+
+def _dropped_in_flight(method: str) -> "BlenderConnectionError":
+    """A call whose bytes may already have reached Blender. It is not sent again."""
+    logger.warning("Connection dropped while %s was in flight; not retrying", method)
+    return BlenderConnectionError(
+        f"The connection to Blender dropped while '{method}' was in flight. "
+        "The call may already have run in Blender and was not retried."
+    )
+
 
 class BlenderConnectionError(Exception):
-    """Raised when connection to Blender fails."""
+    """Raised when connection to Blender fails.
 
-    pass
+    ``retry_backoff`` is set when another immediate attempt would hit a Blender that
+    is not accepting connections. ``connect`` then waits before trying again.
+    """
+
+    def __init__(self, message: str, *, retry_backoff: bool = False):
+        super().__init__(message)
+        self.retry_backoff = retry_backoff
 
 
 class _NotMeshwire(BlenderConnectionError):
@@ -46,8 +116,8 @@ class _Unproven(BlenderConnectionError):
 class _NoAnswer(_Unproven):
     """A connect or handshake step ran out of time."""
 
-    def __init__(self, message: str, seconds: float):
-        super().__init__(message)
+    def __init__(self, message: str, seconds: float, *, retry_backoff: bool = False):
+        super().__init__(message, retry_backoff=retry_backoff)
         self.seconds = seconds
 
 
@@ -59,6 +129,34 @@ class BlenderCommandError(Exception):
     """Raised when a Blender command fails."""
 
     pass
+
+
+class _Pending:
+    """One command waiting for its reply."""
+
+    __slots__ = ("future", "method", "sent")
+
+    def __init__(self, future: asyncio.Future, method: str):
+        self.future = future
+        self.method = method
+        self.sent = False  # True once the bytes were handed to the socket
+
+
+def _quiet_future(future: asyncio.Future) -> None:
+    """Retrieve a stored exception so it is not reported when the future is destroyed."""
+    if future.cancelled() or not future.done():
+        return
+    future.exception()
+
+
+def _fail_future(future: asyncio.Future, exc: Exception) -> None:
+    """Fail ``future`` unless a reply or an earlier error already settled it."""
+    if future.done():
+        return
+    try:
+        future.set_exception(exc)
+    except asyncio.InvalidStateError:
+        return
 
 
 class BlenderClient:
@@ -78,9 +176,11 @@ class BlenderClient:
         self._lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._connected = False
-        self._pending_requests: dict[str, asyncio.Future] = {}
+        self._pending_requests: dict[str, _Pending] = {}
         self._read_task: asyncio.Task | None = None
         self._epoch = 0  # bumped by disconnect(); an _open() that straddles one is void
+        self._failed_connects = 0
+        self._reconnect_after = 0.0  # monotonic time; 0 means the next attempt may dial now
 
     @property
     def connected(self) -> bool:
@@ -104,7 +204,34 @@ class BlenderClient:
         async with self._connect_lock:
             if self._connected:
                 return
-            await self._open(timeout)
+            await self._wait_to_reconnect()
+            try:
+                await self._open(timeout)
+            except BlenderConnectionError as exc:
+                if exc.retry_backoff:
+                    delay = self._arm_reconnect_backoff()
+                    raise BlenderConnectionError(
+                        _backoff_notice(exc, delay),
+                        retry_backoff=True,
+                    ) from None
+                raise
+            else:
+                self._failed_connects = 0
+                self._reconnect_after = 0.0
+
+    async def _wait_to_reconnect(self) -> None:
+        """Sleep out whatever delay the previous failed connect armed."""
+        remaining = self._reconnect_after - _now()
+        if remaining > 0:
+            logger.info("Waiting %.2f s before reconnecting to Blender", remaining)
+            await _pause(remaining)
+
+    def _arm_reconnect_backoff(self) -> float:
+        """Record the jittered delay the next connect must wait, and return it."""
+        self._failed_connects += 1
+        delay = reconnect_delay(self._failed_connects, _jitter_factor())
+        self._reconnect_after = _now() + delay
+        return delay
 
     async def _discover(self) -> list[dict]:
         """Live instances to try, newest first. Empty when the port is fixed or the host remote.
@@ -178,19 +305,21 @@ class BlenderClient:
                 if epoch != self._epoch:
                     raise
                 reason = str(e).splitlines()[0] if str(e) else type(e).__name__
-                failures.append((instance, reason))
+                failures.append((instance, reason, e.retry_backoff))
             except BlenderConnectionError as e:
                 if epoch != self._epoch:
                     raise
                 raise self._stopped_at(instance, position, e, timeout) from None
         lines = [
-            f"  port {i['port']} ({self._instance_file(i)}): {reason}" for i, reason in failures
+            f"  port {i['port']} ({self._instance_file(i)}): {reason}"
+            for i, reason, _backoff in failures
         ]
         raise BlenderConnectionError(
             "Could not connect to any of the Meshwire instances found:\n"
             + "\n".join(lines)
             + "\nA file here may be stale, or another program may hold that port. "
-            "Pass --port or set MESHWIRE_PORT to pick the Blender to use."
+            "Pass --port or set MESHWIRE_PORT to pick the Blender to use.",
+            retry_backoff=bool(failures) and all(backoff for _i, _reason, backoff in failures),
         )
 
     @staticmethod
@@ -207,7 +336,8 @@ class BlenderClient:
             # The add-on proved itself, so this is a genuine Blender's own answer.
             return BlenderConnectionError(
                 f"{error}\nThis came from the Blender on port {port} (instance file {file}). "
-                f"Not trying another Blender, because this one is the right one. You can {way_out}."
+                f"Not trying another Blender, because this one is the right one. You can {way_out}.",
+                retry_backoff=error.retry_backoff,
             )
         stale = (
             f"If no Blender with process ID {instance['pid']} is running, that file is stale: "
@@ -217,16 +347,19 @@ class BlenderClient:
         if isinstance(error, _NoAnswer):
             return BlenderConnectionError(
                 f"{where} did not answer within {error.seconds:g} s; if it is a Blender, it may "
-                f"be busy. Try again, or {way_out}. {stale}"
+                f"be busy. Try again, or {way_out}. {stale}",
+                retry_backoff=error.retry_backoff,
             )
         if isinstance(error, _ClosedEarly):
             return BlenderConnectionError(
                 f"{where} closed the connection before answering. A busy or full Meshwire "
-                f"add-on does this. Try again, or {way_out}. {stale}"
+                f"add-on does this. Try again, or {way_out}. {stale}",
+                retry_backoff=error.retry_backoff,
             )
         return BlenderConnectionError(
             f"{error}\nThis came from {where[0].lower() + where[1:]}. Not trying another "
-            f"Blender, because this one may be the right one. You can {way_out}. {stale}"
+            f"Blender, because this one may be the right one. You can {way_out}. {stale}",
+            retry_backoff=error.retry_backoff,
         )
 
     async def _connect_to(self, token: str, timeout: float, epoch: int) -> None:
@@ -255,14 +388,20 @@ class BlenderClient:
                 writer.close()  # whatever failed, this socket is ours to close
             if isinstance(exc, asyncio.TimeoutError):
                 raise _NoAnswer(
-                    f"Connection to Blender timed out ({self.host}:{self.port})", timeout
+                    f"Connection to Blender timed out ({self.host}:{self.port})",
+                    timeout,
+                    retry_backoff=True,
                 ) from None
             if isinstance(exc, ConnectionRefusedError):
                 raise _NotMeshwire(
-                    f"Connection refused. Is Blender running with MCP addon enabled? ({self.host}:{self.port})"
+                    f"Connection refused. Is Blender running with MCP addon enabled? ({self.host}:{self.port})",
+                    retry_backoff=True,
                 ) from None
             if isinstance(exc, OSError):
-                raise BlenderConnectionError(f"Connection failed: {exc}") from None
+                raise BlenderConnectionError(
+                    f"Connection failed: {exc}",
+                    retry_backoff=True,
+                ) from None
             raise
 
     def _token_help(self) -> str:
@@ -503,10 +642,15 @@ class BlenderClient:
             except Exception:
                 pass
 
-        # Cancel any pending requests
-        for future in pending:
-            if not future.done():
-                future.set_exception(BlenderConnectionError("Disconnected"))
+        # A call already handed to the socket is not sent again: it may have changed
+        # the scene. One that never left gets the plain disconnect.
+        for item in pending:
+            if item.future.done():
+                continue
+            if item.sent:
+                _fail_future(item.future, _dropped_in_flight(item.method))
+            else:
+                _fail_future(item.future, BlenderConnectionError("Disconnected"))
 
         logger.info("Disconnected from Blender")
 
@@ -527,8 +671,14 @@ class BlenderClient:
         Returns:
             The result from Blender
 
+        The command is written once. Nothing here sends it a second time, including
+        a call that changes the scene. If the socket drops after the bytes were
+        handed over, the error says the call may already have run in Blender and
+        was not retried. A later call opens a new connection, which is how a
+        restarted Blender is picked up.
+
         Raises:
-            BlenderConnectionError: If not connected
+            BlenderConnectionError: If not connected, or the socket drops in flight
             BlenderCommandError: If the command fails
             asyncio.TimeoutError: If response times out
         """
@@ -551,28 +701,39 @@ class BlenderClient:
 
         # Create future for response
         future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending_requests[request_id] = future
+        pending = _Pending(future, method)
+        self._pending_requests[request_id] = pending
 
         try:
-            # Send request
+            # Send request. Once ``sent`` is set, this call is never written again.
             async with self._lock:
-                message = json.dumps(request) + "\n"
-                self._writer.write(message.encode("utf-8"))
-                await self._writer.drain()
+                writer = self._writer
+                if writer is None or not self._connected:
+                    raise BlenderConnectionError("Not connected to Blender")
+                writer.write((json.dumps(request) + "\n").encode("utf-8"))
+                pending.sent = True
+                await writer.drain()
 
             logger.debug(f"Sent command: {method}")
 
             # Wait for response
-            result = await asyncio.wait_for(future, timeout=timeout)
-            return result
+            return await asyncio.wait_for(future, timeout=timeout)
 
         except asyncio.TimeoutError:
-            self._pending_requests.pop(request_id, None)
-            raise asyncio.TimeoutError(f"Command '{method}' timed out after {timeout}s")
+            raise asyncio.TimeoutError(f"Command '{method}' timed out after {timeout}s") from None
 
-        except Exception:
-            self._pending_requests.pop(request_id, None)
+        except BlenderConnectionError:
             raise
+
+        except (ConnectionError, OSError, asyncio.IncompleteReadError):
+            if pending.sent:
+                # The scene may already reflect this call. Do not reconnect and resend.
+                raise _dropped_in_flight(method) from None
+            raise
+
+        finally:
+            self._pending_requests.pop(request_id, None)
+            _quiet_future(future)
 
     async def _read_loop(self) -> None:
         """Background task to read responses from Blender."""
@@ -619,9 +780,8 @@ class BlenderClient:
         """Fail every request still waiting for a reply with ``exc``."""
         pending = list(self._pending_requests.values())
         self._pending_requests.clear()
-        for future in pending:
-            if not future.done():
-                future.set_exception(exc)
+        for item in pending:
+            _fail_future(item.future, exc)
 
     async def _handle_response(self, data: bytes) -> None:
         """Handle a JSON-RPC response from Blender."""
@@ -650,17 +810,22 @@ class BlenderClient:
                 logger.warning("Received response without ID")
             return
 
-        future = self._pending_requests.pop(request_id, None)
-        if future is None:
+        pending = self._pending_requests.pop(request_id, None)
+        if pending is None:
             logger.warning(f"Received response for unknown request: {request_id}")
             return
 
         if "error" in response:
             error = response["error"]
             error_msg = error.get("message", str(error))
-            future.set_exception(BlenderCommandError(error_msg))
+            _fail_future(pending.future, BlenderCommandError(error_msg))
         else:
-            future.set_result(response.get("result"))
+            if pending.future.done():
+                return
+            try:
+                pending.future.set_result(response.get("result"))
+            except asyncio.InvalidStateError:
+                return
 
     async def ping(self, timeout: float = 5.0) -> bool:
         """

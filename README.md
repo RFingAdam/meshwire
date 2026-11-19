@@ -353,6 +353,13 @@ Which Blender the server talks to is decided in this order:
    a loopback address.
 4. Port 9876.
 
+If a connection is refused or times out, the next attempt waits before dialling again. The wait
+starts at a quarter of a second, doubles on each failure up to 8 seconds, and is shortened by a
+random factor so retries do not all land together. The error names that wait. A call that was
+already sent when the socket drops is not sent again, because it may have changed the scene: the
+error says it may already have run in Blender. The next call connects again, which is also how a
+Blender that restarted is found.
+
 An explicit port is never second-guessed by discovery. With several Blenders open and no port given,
 the newest one wins; pass `--port` to talk to another.
 
