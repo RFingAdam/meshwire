@@ -17,8 +17,8 @@ from contextlib import closing
 
 import pytest
 
+from mcp_blender import blender_client, wire
 from mcp_blender import server as server_module
-from mcp_blender import wire
 from mcp_blender.blender_client import BlenderClient, BlenderConnectionError, _NotMeshwire
 from tests.test_client import V040_UNKNOWN_METHOD, MockBlenderServer
 from tests.test_socket_server import ROOT, _own_config_dir, mod, server  # noqa: F401
@@ -661,16 +661,21 @@ def test_remote_host_never_discovers(cfg, monkeypatch):
 
 
 def test_discovery_happens_again_on_every_open(cfg, monkeypatch):
+    """Each open looks again. The second waits out the reconnect backoff first."""
     wire.ensure_token()
     answers = iter([[fake_instance(9877, 1.0)], [fake_instance(9879, 2.0)]])
     monkeypatch.setattr(wire, "live_instances", lambda: next(answers))
     seen = refusing(monkeypatch)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(blender_client.time, "monotonic", lambda: clock["now"])
 
     async def twice():
         client = BlenderClient("127.0.0.1", None)
-        for _ in range(2):
-            with pytest.raises(BlenderConnectionError):
-                await client.connect(timeout=1)
+        with pytest.raises(BlenderConnectionError):
+            await client.connect(timeout=1)
+        clock["now"] = blender_client.RECONNECT_MAX_DELAY + 1
+        with pytest.raises(BlenderConnectionError):
+            await client.connect(timeout=1)
 
     asyncio.run(twice())
     assert seen == [9877, 9879]

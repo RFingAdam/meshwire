@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Reconnects to Blender wait, and a dropped call is not sent twice.** After a failed connection
+  the next attempt waits. The wait grows with jitter and stops at 8 seconds, and the error says
+  how long, so a stopped Blender is not dialed on every call. A call already sent when the socket
+  drops fails with an error that it may already have run in Blender and was not retried. Calls that
+  change the scene are never retried automatically.
+
 ## [0.5.0] - 2026-11-06
 
 ### Security

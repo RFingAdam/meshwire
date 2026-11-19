@@ -54,11 +54,19 @@ def configured_port(flag: int | None) -> int | None:
 
 
 async def get_client(host: str = "127.0.0.1", port: int | None = None) -> BlenderClient:
-    """Get or create the Blender client connection."""
+    """Get or create the Blender client connection.
+
+    The same client is kept while the socket is down. Replacing it on every call
+    would throw away the reconnect backoff, and a stopped Blender would be dialed
+    every time.
+    """
     global _client
     async with _client_lock:
-        if _client is None or not _client.connected:
+        if _client is None or not _client.same_target(host, port):
+            if _client is not None and _client.connected:
+                await _client.disconnect()
             _client = BlenderClient(host, port)
+        if not _client.connected:
             await _client.connect()
         return _client
 
