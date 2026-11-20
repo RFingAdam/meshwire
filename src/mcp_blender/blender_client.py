@@ -5,7 +5,9 @@ import hmac
 import json
 import logging
 import os
+import random
 import socket
+import time
 import uuid
 from typing import Any
 
@@ -17,6 +19,10 @@ logger = logging.getLogger("meshwire.client")
 MAX_REPLY_LINE = 256 * 1024 * 1024 + 1024 * 1024
 READ_SIZE = 1024 * 1024
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+# After a failed connect, the next attempt waits this long. Each further failure doubles it.
+RECONNECT_BASE_DELAY = 0.25
+# Jitter stays inside this ceiling, so a stopped Blender is never polled faster than this.
+RECONNECT_MAX_DELAY = 8.0
 
 
 class BlenderConnectionError(Exception):
@@ -61,6 +67,27 @@ class BlenderCommandError(Exception):
     pass
 
 
+def reconnect_delay(failures: int, unit_interval: float) -> float:
+    """Seconds to wait after ``failures`` consecutive failed connects.
+
+    The ceiling starts at ``RECONNECT_BASE_DELAY`` and doubles, and it stops at
+    ``RECONNECT_MAX_DELAY``. ``unit_interval`` is from 0 to 1. The wait is the
+    upper half of that ceiling: never zero, never past the cap, and two draws
+    at the same step are not the same delay.
+    """
+    steps = min(failures - 1, 32)
+    ceiling = min(RECONNECT_MAX_DELAY, RECONNECT_BASE_DELAY * (2**steps))
+    return ceiling * (0.5 + 0.5 * unit_interval)
+
+
+def _dropped_in_flight(method: str) -> BlenderConnectionError:
+    """The socket died after this call was sent. It must not be sent again."""
+    return BlenderConnectionError(
+        f"The connection to Blender dropped while '{method}' was in flight. "
+        "The call may already have run in Blender and was not retried."
+    )
+
+
 class BlenderClient:
     """
     Async TCP client for communicating with the Meshwire addon.
@@ -78,14 +105,25 @@ class BlenderClient:
         self._lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._connected = False
-        self._pending_requests: dict[str, asyncio.Future] = {}
+        self._pending_requests: dict[str, tuple[str, asyncio.Future]] = {}
         self._read_task: asyncio.Task | None = None
         self._epoch = 0  # bumped by disconnect(); an _open() that straddles one is void
+        self._connect_failures = 0
+        self._reconnect_after = 0.0  # monotonic time before which connect() will not dial
+        self._dialed = False  # the connect in progress reached open_connection
 
     @property
     def connected(self) -> bool:
         """Check if client is connected."""
         return self._connected and self._writer is not None
+
+    def same_target(self, host: str, port: int | None) -> bool:
+        """True when this client was opened for this host and fixed port.
+
+        ``self.port`` is the port in use, which discovery may change. The fixed
+        port is the one the caller asked for, or None when it should be found.
+        """
+        return self.host == host and self._fixed_port == port
 
     async def connect(self, timeout: float = 5.0) -> None:
         """
@@ -104,7 +142,43 @@ class BlenderClient:
         async with self._connect_lock:
             if self._connected:
                 return
-            await self._open(timeout)
+            self._hold_backoff()
+            epoch = self._epoch
+            self._dialed = False
+            try:
+                await self._open(timeout)
+            except BlenderConnectionError:
+                # A disconnect() during the attempt changed the epoch. That is a local
+                # cancel, not a Blender that refused us, so it does not start the wait.
+                if epoch == self._epoch and self._dialed:
+                    self._record_connect_failure()
+                raise
+            self._connect_failures = 0
+            self._reconnect_after = 0.0
+
+    def _hold_backoff(self) -> None:
+        """Refuse to dial again until the jittered wait from the last failure is over."""
+        remaining = self._reconnect_after - time.monotonic()
+        if remaining <= 0:
+            return
+        raise BlenderConnectionError(
+            f"Waiting {remaining:.2f}s before reconnecting to Blender at "
+            f"{self.host}:{self.port}. Reconnect attempts back off with jitter and are "
+            f"capped at {RECONNECT_MAX_DELAY:g}s, so a stopped Blender is not contacted "
+            "on every call. Start the server in Blender's Meshwire tab, then try again "
+            "after the wait."
+        )
+
+    def _record_connect_failure(self) -> None:
+        self._connect_failures += 1
+        delay = reconnect_delay(self._connect_failures, random.random())
+        self._reconnect_after = time.monotonic() + delay
+        logger.info(
+            "Blender connect failed (%s in a row); next attempt in %.2fs, capped at %ss",
+            self._connect_failures,
+            delay,
+            RECONNECT_MAX_DELAY,
+        )
 
     async def _discover(self) -> list[dict]:
         """Live instances to try, newest first. Empty when the port is fixed or the host remote.
@@ -231,6 +305,7 @@ class BlenderClient:
 
     async def _connect_to(self, token: str, timeout: float, epoch: int) -> None:
         """One connection attempt at ``self.port``: connect, handshake, install."""
+        self._dialed = True
 
         def voided() -> None:
             """Stop at once if a disconnect() ran while this open was waiting."""
@@ -475,8 +550,13 @@ class BlenderClient:
             return self._protocol_error(number)
         return _NotMeshwire(f"The program on {peer} did not complete the Meshwire handshake.")
 
-    async def disconnect(self) -> None:
-        """Disconnect from Blender."""
+    async def disconnect(self, *, dropped: bool = False) -> None:
+        """Disconnect from Blender.
+
+        ``dropped`` means the socket closed under a call that was already sent. Those
+        calls may have run in Blender, so each one fails with that reason and is not
+        retried. An intentional disconnect keeps the plain "Disconnected" error.
+        """
         self._connected = False
         self._epoch += 1  # voids an _open() still waiting on its hello
 
@@ -503,10 +583,16 @@ class BlenderClient:
             except Exception:
                 pass
 
-        # Cancel any pending requests
-        for future in pending:
+        # Cancel any pending requests. A socket drop must not be retried: the call
+        # may already have changed the scene.
+        for method, future in pending:
             if not future.done():
-                future.set_exception(BlenderConnectionError("Disconnected"))
+                error = (
+                    _dropped_in_flight(method)
+                    if dropped
+                    else BlenderConnectionError("Disconnected")
+                )
+                future.set_exception(error)
 
         logger.info("Disconnected from Blender")
 
@@ -528,9 +614,13 @@ class BlenderClient:
             The result from Blender
 
         Raises:
-            BlenderConnectionError: If not connected
+            BlenderConnectionError: If not connected, or the socket dropped in flight
             BlenderCommandError: If the command fails
             asyncio.TimeoutError: If response times out
+
+        The call is sent at most once. If the socket drops after it is in flight, the
+        error says it may already have run in Blender and was not retried. Calls that
+        change the scene are never retried automatically.
         """
         if not self._connected:
             await self.connect()
@@ -551,7 +641,7 @@ class BlenderClient:
 
         # Create future for response
         future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending_requests[request_id] = future
+        self._pending_requests[request_id] = (method, future)
 
         try:
             # Send request
@@ -583,9 +673,9 @@ class BlenderClient:
             try:
                 data = await self._reader.read(READ_SIZE)
                 if not data:
-                    # Connection closed
+                    # Connection closed under whatever calls were already sent.
                     logger.warning("Connection closed by Blender")
-                    await self.disconnect()
+                    await self.disconnect(dropped=True)
                     break
 
                 buffer += data
@@ -612,14 +702,14 @@ class BlenderClient:
                 break
             except Exception as e:
                 logger.error(f"Read error: {e}")
-                await self.disconnect()
+                await self.disconnect(dropped=True)
                 break
 
     def _fail_pending(self, exc: Exception) -> None:
         """Fail every request still waiting for a reply with ``exc``."""
         pending = list(self._pending_requests.values())
         self._pending_requests.clear()
-        for future in pending:
+        for _method, future in pending:
             if not future.done():
                 future.set_exception(exc)
 
@@ -650,10 +740,11 @@ class BlenderClient:
                 logger.warning("Received response without ID")
             return
 
-        future = self._pending_requests.pop(request_id, None)
-        if future is None:
+        pending = self._pending_requests.pop(request_id, None)
+        if pending is None:
             logger.warning(f"Received response for unknown request: {request_id}")
             return
+        _method, future = pending
 
         if "error" in response:
             error = response["error"]

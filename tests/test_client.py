@@ -59,6 +59,8 @@ class MockBlenderServer:
         self.hello_overrides: dict = {}  # fields to change in the hello result
         self.hello_gate: asyncio.Event | None = None  # hold the hello reply until set
         self.hello_seen = asyncio.Event()
+        self.drop_command = False  # accept one command, record it, then close with no reply
+        self.writers: list[asyncio.StreamWriter] = []
         self.received = bytearray()  # every byte any client wrote
         self.hellos: list[dict] = []
         self.proofs: list[dict] = []
@@ -85,8 +87,18 @@ class MockBlenderServer:
         """Set a mock response for a method."""
         self._responses[method] = result
 
+    async def drop_clients(self) -> None:
+        """Close every accepted socket, the way a quitting Blender does."""
+        for writer in list(self.writers):
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a client connection."""
+        self.writers.append(writer)
         buffer = b""
         nonce_c = nonce_s = ""
         seen = wire.endpoint(*writer.get_extra_info("sockname")[:2])
@@ -130,6 +142,9 @@ class MockBlenderServer:
                         response.update({"error": error} if error else {"result": {"ok": True}})
                     else:
                         self.commands.append(request)
+                        if self.drop_command:
+                            writer.close()
+                            return
                         response = self._process_request(request)
                     writer.write((json.dumps(response) + "\n").encode("utf-8"))
                     await writer.drain()
