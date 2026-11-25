@@ -75,6 +75,14 @@ meshwire/
   HMAC-SHA256 over fresh nonces, so the token never crosses the socket, and `wire.py` holds the shared
   code. After that the stream is plain newline-delimited JSON with no encryption or integrity check, so
   the add-on belongs on a loopback address (use an SSH tunnel for remote use). See `SECURITY.md`.
+- **Idle timeout.** The add-on closes an authenticated connection that has sent nothing and taken
+  no reply bytes for 300 seconds, so a crashed or abandoned client does not hold one of the 8 client
+  slots for ever. Set it under Preferences > Add-ons > Meshwire > Idle Timeout; 0 turns it off. A
+  handler that runs longer holds Blender's main thread, so no idle check runs until its reply is
+  queued. The hello reply carries `idle_timeout`, so the MCP server replaces a connection that is
+  within 5 seconds of it before sending a call, and the call cannot race the close. After an idle
+  close the server reconnects to the same Blender while it is still live, not to a newer one.
+  `ping` is a valid keep-alive.
 - **`bpy.app.timers` dispatch.** A timer polls the socket and runs each
   command inline on Blender's main thread.
 - **20-file handler package.** Originally a single `handlers.py`; was

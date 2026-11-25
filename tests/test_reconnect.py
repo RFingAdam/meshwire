@@ -189,3 +189,136 @@ async def test_call_in_flight_when_the_socket_drops_is_not_retried(mock_server):
         assert len(mock_server.hellos) == 2
     finally:
         await client.disconnect()
+
+
+# The add-on's idle timeout, as the client sees it.
+
+
+@pytest.mark.parametrize(
+    "value", [None, True, "300", -1, 0, float("inf"), float("nan"), [300], {"s": 300}]
+)
+def test_only_a_positive_finite_idle_timeout_counts(value):
+    assert BlenderClient._advertised_idle(value) == 0.0
+
+
+def test_a_positive_idle_timeout_is_kept():
+    assert BlenderClient._advertised_idle(300) == 300.0
+    assert BlenderClient._advertised_idle(12.5) == 12.5
+
+
+@pytest.mark.asyncio
+async def test_idle_connection_is_replaced_before_a_call_is_sent(mock_server):
+    """Close to the add-on's idle timeout, the call goes out once, on a fresh connection."""
+    mock_server.hello_overrides = {"idle_timeout": 300}
+    client = BlenderClient(mock_server.host, mock_server.port)
+    await client.connect()
+    try:
+        assert client._idle_timeout == 300.0
+        client._last_io -= 300 - blender_client.IDLE_MARGIN
+        result = await client.send_command("ping", timeout=5.0)
+        assert result["pong"] is True
+        assert len(mock_server.hellos) == 2
+        assert [command["method"] for command in mock_server.commands] == ["ping"]
+        assert client._resume_port is None  # used by the reconnect
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_connection_short_of_the_idle_timeout_is_kept(mock_server):
+    mock_server.hello_overrides = {"idle_timeout": 300}
+    client = BlenderClient(mock_server.host, mock_server.port)
+    await client.connect()
+    try:
+        client._last_io -= 100
+        await client.send_command("ping", timeout=5.0)
+        assert len(mock_server.hellos) == 1
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_an_addon_without_an_idle_timeout_keeps_the_connection(mock_server):
+    """An add-on that does not advertise one (0.5.0) is never treated as idle."""
+    client = BlenderClient(mock_server.host, mock_server.port)
+    await client.connect()
+    try:
+        assert client._idle_timeout == 0.0
+        client._last_io -= 10**6
+        await client.send_command("ping", timeout=5.0)
+        assert len(mock_server.hellos) == 1
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_call_waiting_for_its_reply_is_not_idle(mock_server):
+    mock_server.hello_overrides = {"idle_timeout": 300}
+    client = BlenderClient(mock_server.host, mock_server.port)
+    await client.connect()
+    try:
+        client._last_io -= 10**6
+        assert client._idle_expired()
+        client._pending_requests["x"] = ("render", asyncio.get_running_loop().create_future())
+        assert not client._idle_expired()
+        client._pending_requests.clear()
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_idle_close_by_blender_is_not_a_dropped_call(mock_server):
+    """Blender closing an idle connection fails nothing; the next call reconnects."""
+    mock_server.hello_overrides = {"idle_timeout": 300}
+    client = BlenderClient(mock_server.host, mock_server.port)
+    await client.connect()
+    try:
+        client._last_io -= 400
+        await mock_server.drop_clients()
+        for _ in range(100):
+            if not client.connected:
+                break
+            await asyncio.sleep(0.01)
+        assert not client.connected
+        assert client._resume_port == mock_server.port
+        result = await client.send_command("ping", timeout=5.0)
+        assert result["pong"] is True
+        assert len(mock_server.hellos) == 2
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_idle_reconnect_stays_on_the_same_blender(monkeypatch, mock_server):
+    """With discovery, an idle reconnect keeps the Blender in use over a newer one."""
+    async with MockBlenderServer() as newer:
+        older = {"port": mock_server.port, "blender": "4.5", "blend": "", "pid": 1}
+        newest = {"port": newer.port, "blender": "4.5", "blend": "", "pid": 2}
+        for server in (mock_server, newer):
+            server.hello_overrides = {"idle_timeout": 300}
+        client = BlenderClient(mock_server.host)
+        found = [[older]]
+
+        async def discover():
+            return found[0]
+
+        monkeypatch.setattr(client, "_discover", discover)
+        await client.connect()
+        try:
+            assert client.port == mock_server.port
+            found[0] = [newest, older]  # a newer Blender started meanwhile
+            client._last_io -= 400
+            await client.send_command("ping", timeout=5.0)
+            assert client.port == mock_server.port
+            assert len(newer.hellos) == 0
+            # Any other reconnect still picks the newest, as before.
+            await mock_server.drop_clients()
+            for _ in range(100):
+                if not client.connected:
+                    break
+                await asyncio.sleep(0.01)
+            assert client._resume_port is None  # a drop after activity is not idle
+            await client.send_command("ping", timeout=5.0)
+            assert client.port == newer.port
+        finally:
+            await client.disconnect()

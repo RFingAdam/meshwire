@@ -8,7 +8,13 @@ _logger.info("Meshwire addon loaded")
 import bpy
 
 from . import security, wire
-from .socket_server import BindError, MCPSocketServer, TokenError
+from .socket_server import (
+    DEFAULT_IDLE_TIMEOUT,
+    MAX_IDLE_TIMEOUT,
+    BindError,
+    MCPSocketServer,
+    TokenError,
+)
 
 # The id Blender files this add-on's preferences under. It is the package name, so it
 # follows the add-on when it is installed as an extension. Never spell it out elsewhere.
@@ -67,6 +73,15 @@ def legacy_addon_enabled() -> bool:
         return False
 
 
+def idle_timeout() -> int:
+    """Seconds from Preferences after which an idle client is closed. 0 means never."""
+    prefs = get_preferences()
+    if prefs is None:
+        return DEFAULT_IDLE_TIMEOUT
+    value = getattr(prefs, "idle_timeout", DEFAULT_IDLE_TIMEOUT)
+    return value if type(value) is int and value >= 0 else DEFAULT_IDLE_TIMEOUT
+
+
 def server_address() -> tuple[str, int]:
     """Host and port from Preferences. Port 0 means pick the first free one."""
     prefs = get_preferences()
@@ -91,6 +106,16 @@ class MeshwirePreferences(bpy.types.AddonPreferences):
         default=0,
         min=0,
         max=65535,
+    )
+    idle_timeout: bpy.props.IntProperty(
+        name="Idle Timeout (s)",
+        description=(
+            "Close a connected client that sends nothing for this many seconds. "
+            "The MCP server reconnects on its next call. 0 never closes an idle client"
+        ),
+        default=DEFAULT_IDLE_TIMEOUT,
+        min=0,
+        max=MAX_IDLE_TIMEOUT,
     )
     rodin_api_key: bpy.props.StringProperty(
         name="Rodin API key",
@@ -136,6 +161,7 @@ class MeshwirePreferences(bpy.types.AddonPreferences):
         layout = self.layout
         layout.prop(self, "host")
         layout.prop(self, "port")
+        layout.prop(self, "idle_timeout")
         layout.prop(self, "rodin_api_key")
         layout.prop(self, "meshy_api_key")
         layout.prop(self, "comfyui_workflow")
@@ -164,6 +190,7 @@ class MESHWIRE_OT_StartServer(bpy.types.Operator):
 
         host, port = server_address()
         server = MCPSocketServer(host=host, port=port)
+        server.idle_timeout = idle_timeout()
         try:
             server.start()
         except (BindError, TokenError) as e:
