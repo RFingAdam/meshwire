@@ -1115,6 +1115,7 @@ def test_wrong_proof_client_that_never_reads_leaves_by_the_deadline(server, mod)
 
 def test_deadline_applies_only_before_hello(server, mod):
     """A 10 s handler, run after auth, costs the client nothing."""
+    server.idle_timeout = 0  # the hour below is about the handshake deadline, not idling
     clock = with_clock(server)
     sock = connect(server)
     real = server.handlers.handle
@@ -1496,3 +1497,101 @@ def test_stop_unregisters_the_exit_handler(mod, monkeypatch):
     assert srv.start()
     srv.stop()
     assert unregistered == registered and len(registered) == 1
+
+
+# Idle timeout: an authenticated client that sends and takes nothing is closed.
+
+
+def test_hello_advertises_the_idle_timeout(server, mod):
+    sock = connect(server, auth=False)
+    assert handshake(server, sock)["idle_timeout"] == mod.DEFAULT_IDLE_TIMEOUT == 300
+    server.idle_timeout = 0
+    other = connect(server, auth=False)
+    assert handshake(server, other)["idle_timeout"] == 0
+
+
+def test_idle_client_is_closed_after_the_idle_timeout(server, capsys):
+    clock = with_clock(server)
+    server.idle_timeout = 300
+    sock = connect(server)
+    tick(server)
+    clock.t += 299
+    tick(server, 3)
+    assert server.client_count == 1 and not only_client(server).closing
+    clock.t += 2
+    tick(server)
+    assert only_client(server).closing
+    assert read_all(server, sock) == b""  # a graceful close: EOF, no error line
+    sock.close()  # the peer closes in turn, and the add-on lets the client go
+    pump(server, until=lambda: server.client_count == 0)
+    assert "idle for 301s (limit 300s)" in capsys.readouterr().out
+
+
+def test_a_request_resets_the_idle_timer(server):
+    clock = with_clock(server)
+    server.idle_timeout = 300
+    sock = connect(server)
+    clock.t += 200
+    request(sock, "ping", req_id=7)
+    assert read_line(server, sock)["id"] == 7
+    clock.t += 200
+    tick(server, 3)
+    assert server.client_count == 1 and not only_client(server).closing
+    request(sock, "ping", req_id=8)
+    assert read_line(server, sock)["id"] == 8
+    clock.t += 301
+    tick(server)
+    assert only_client(server).closing
+
+
+def test_idle_timeout_zero_never_closes(server):
+    clock = with_clock(server)
+    server.idle_timeout = 0
+    sock = connect(server)
+    clock.t += 10**7
+    tick(server, 3)
+    request(sock, "ping", req_id=9)
+    assert read_line(server, sock)["id"] == 9
+
+
+def test_a_long_handler_is_not_idle(server):
+    """A handler that runs past the timeout holds the main thread; its reply still arrives."""
+    clock = with_clock(server)
+    server.idle_timeout = 300
+    sock = connect(server)
+    real = server.handlers.handle
+
+    def slow(method, params):
+        if method == "render":
+            clock.t += 1000.0
+            return {"done": True}
+        return real(method, params)
+
+    server.handlers.handle = slow
+    request(sock, "render", req_id=3)
+    reply = read_line(server, sock)
+    assert reply["id"] == 3 and reply["result"] == {"done": True}
+    assert server.client_count == 1 and not only_client(server).closing
+
+
+def test_a_partial_line_that_stops_arriving_is_idle(server):
+    clock = with_clock(server)
+    server.idle_timeout = 300
+    sock = connect(server)
+    sock.sendall(b'{"jsonrpc": "2.0", "method": "pi')
+    pump(server, until=lambda: len(only_client(server).rbuf) > 0)
+    clock.t += 301
+    tick(server)
+    assert only_client(server).closing
+    assert read_all(server, sock) == b""
+
+
+def test_idle_timeout_does_not_touch_the_handshake_clock(server, mod):
+    """Before auth the 2 s hello deadline applies, not the idle timeout."""
+    clock = with_clock(server)
+    server.idle_timeout = 3600
+    connect(server, auth=False)
+    tick(server)
+    clock.t += mod.wire.HELLO_SECONDS + 0.1
+    tick(server)
+    assert server.client_count == 0

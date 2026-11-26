@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -23,6 +24,9 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 RECONNECT_BASE_DELAY = 0.25
 # Jitter stays inside this ceiling, so a stopped Blender is never polled faster than this.
 RECONNECT_MAX_DELAY = 8.0
+# A connection idle this close to the add-on's idle timeout is replaced before a call is
+# sent on it, so the call never races the add-on closing the socket.
+IDLE_MARGIN = 5.0
 
 
 class BlenderConnectionError(Exception):
@@ -111,6 +115,9 @@ class BlenderClient:
         self._connect_failures = 0
         self._reconnect_after = 0.0  # monotonic time before which connect() will not dial
         self._dialed = False  # the connect in progress reached open_connection
+        self._idle_timeout = 0.0  # the add-on's idle timeout from the handshake; 0 is none
+        self._last_io = 0.0  # monotonic time of the last byte sent or received
+        self._resume_port: int | None = None  # after an idle close, the Blender to try first
 
     @property
     def connected(self) -> bool:
@@ -214,6 +221,7 @@ class BlenderClient:
         full handshake, until one accepts. A port that is live but not Meshwire (a crashed
         Blender's port taken by another program) so cannot shadow a healthy older Blender.
         """
+        resume, self._resume_port = self._resume_port, None  # one attempt only
         try:
             token = wire.read_token()
         except OSError as e:
@@ -238,6 +246,10 @@ class BlenderClient:
             self.port = wire.PORT_FIRST
             await self._connect_to(token, timeout, epoch)
             return
+        if resume is not None:
+            # An idle close is not a restart: stay on the Blender this client was using
+            # while it is still live, rather than moving to a newer one.
+            found = sorted(found, key=lambda instance: instance["port"] != resume)
         failures = []
         for position, instance in enumerate(found):
             self.port = instance["port"]
@@ -319,9 +331,11 @@ class BlenderClient:
                 timeout=timeout,
             )
             voided()
-            await self._hello(reader, writer, token, timeout, voided)
+            idle_timeout = await self._hello(reader, writer, token, timeout, voided)
             voided()
             self._reader, self._writer = reader, writer
+            self._idle_timeout = idle_timeout
+            self._last_io = time.monotonic()
             self._connected = True
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             self._read_task = asyncio.create_task(self._read_loop())
@@ -400,13 +414,15 @@ class BlenderClient:
         token: str,
         timeout: float,
         voided=lambda: None,
-    ) -> None:
+    ) -> float:
         """Mutual proof of the token, bound to the address reached. The token never goes out.
 
         hello carries a nonce. The add-on answers with its own nonce, the address its
         socket saw the bytes arrive at, and a proof over all three that it holds the
         token. Only if that checks out, and the address is the one dialed, does this side
         send its own proof. Anything else listening learns nothing and gets no command.
+
+        Returns the add-on's idle timeout in seconds, 0 when it has none or did not say.
         """
         peername = writer.get_extra_info("peername") or (self.host, self.port)
         peer = wire.endpoint(str(peername[0]), int(peername[1]))
@@ -476,6 +492,25 @@ class BlenderClient:
         voided()
         if not (isinstance(ok, dict) and ok.get("ok") is True):
             raise BlenderConnectionError("The Meshwire add-on did not accept the handshake")
+        return self._advertised_idle(result.get("idle_timeout"))
+
+    @staticmethod
+    def _advertised_idle(value: Any) -> float:
+        """The idle timeout from the hello reply. Anything but a positive finite number is none."""
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            return 0.0
+        return float(value)
+
+    def _idle_expired(self) -> bool:
+        """True when the add-on has closed, or is about to close, this connection as idle.
+
+        A connection with a call waiting for its reply is never idle: a long handler holds
+        Blender's main thread, and the add-on checks nothing until the reply is queued.
+        """
+        limit = self._idle_timeout
+        if limit <= 0 or self._pending_requests:
+            return False
+        return time.monotonic() - self._last_io >= max(limit - IDLE_MARGIN, limit / 2)
 
     @staticmethod
     async def _override_endpoints(value: str, timeout: float) -> set[str]:
@@ -622,6 +657,17 @@ class BlenderClient:
         error says it may already have run in Blender and was not retried. Calls that
         change the scene are never retried automatically.
         """
+        if self._connected and self._idle_expired():
+            # The add-on closes connections left idle. Replace this one before sending,
+            # so the call cannot be lost to that close and reported as dropped in flight.
+            logger.info(
+                "Connection to Blender idle for over %ss; reconnecting before '%s'",
+                f"{self._idle_timeout:g}",
+                method,
+            )
+            self._resume_port = self.port
+            await self.disconnect()
+
         if not self._connected:
             await self.connect()
 
@@ -648,6 +694,7 @@ class BlenderClient:
             async with self._lock:
                 message = json.dumps(request) + "\n"
                 self._writer.write(message.encode("utf-8"))
+                self._last_io = time.monotonic()
                 await self._writer.drain()
 
             logger.debug(f"Sent command: {method}")
@@ -674,10 +721,19 @@ class BlenderClient:
                 data = await self._reader.read(READ_SIZE)
                 if not data:
                     # Connection closed under whatever calls were already sent.
-                    logger.warning("Connection closed by Blender")
+                    if self._idle_expired():
+                        logger.info(
+                            "Blender closed the connection after %ss idle; the next call "
+                            "reconnects",
+                            f"{self._idle_timeout:g}",
+                        )
+                        self._resume_port = self.port
+                    else:
+                        logger.warning("Connection closed by Blender")
                     await self.disconnect(dropped=True)
                     break
 
+                self._last_io = time.monotonic()
                 buffer += data
 
                 # Process complete messages

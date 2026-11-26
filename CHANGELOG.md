@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Idle clients are closed.** The add-on closes a connected client that has sent nothing and taken
+  no reply for 5 minutes, so a crashed or forgotten client no longer holds one of its 8 client slots.
+  Set the time under Preferences > Add-ons > Meshwire > Idle Timeout (seconds); 0 never closes an
+  idle client. A long render or bake is not idle. The add-on tells the server its timeout in the
+  handshake, so the server opens a fresh connection before a call when the old one is about to be
+  closed, and goes back to the same Blender rather than a newer one. An older server against this
+  add-on, or this server against a 0.5.0 add-on, still works: the older side ignores the new field.
+
 ### Fixed
 
 - **Reconnects to Blender wait, and a dropped call is not sent twice.** After a failed connection

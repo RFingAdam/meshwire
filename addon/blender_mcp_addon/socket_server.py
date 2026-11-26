@@ -35,6 +35,8 @@ LISTEN_BACKLOG = 64  # connections the kernel holds for a busy Blender; Windows 
 MAX_CLOSING = 16  # clients already told to go; past this a refusal closes with no reply
 CLOSE_GRACE = 2.0  # seconds a closing client has to read its last reply, drained or not
 WRITE_STALL = 30.0  # seconds a client may leave unsent reply bytes without taking any
+DEFAULT_IDLE_TIMEOUT = 300  # seconds an authed client may stay silent; 0 is no limit
+MAX_IDLE_TIMEOUT = 86400  # the longest idle timeout Preferences accepts
 
 
 NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
@@ -128,6 +130,7 @@ class _Client:
         self.eof = False  # the peer shut its sending side; read nothing more
         self.half_closed = False  # SHUT_WR sent after the last reply byte left
         self.last_progress = 0.0  # when wbuf last became non-empty or last moved bytes
+        self.last_activity = 0.0  # when an authed client last sent us bytes or took reply bytes
         self.dead = False  # drop on this tick's cleanup pass
 
 
@@ -146,7 +149,12 @@ class MCPSocketServer:
     runs single-threaded.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 9876):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 9876,
+        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+    ):
         self.host = host
         self.requested_port = port  # 0 means the first free port; start() scans afresh each time
         self.port = port  # the port held while running
@@ -157,6 +165,8 @@ class MCPSocketServer:
         self.handlers = CommandHandlers()
         self._timer_registered = False
         self._now = time.monotonic  # one clock for every timer; tests replace it
+        # Seconds an authenticated client may stay silent before it is closed; 0 turns it off.
+        self.idle_timeout = idle_timeout
         self._token = ""  # the secret both sides prove they hold; set by start()
         self._instance_path = None  # the file start() published, removed by stop()
 
@@ -390,6 +400,8 @@ class MCPSocketServer:
                 client.eof = True
                 return
             taken += len(data)
+            if client.authed:
+                client.last_activity = self._now()
             if not client.closing:
                 client.rbuf += data
             elif not client.authed:
@@ -520,6 +532,9 @@ class MCPSocketServer:
             "nonce": client.nonce_s,
             "seen": seen,
             "proof": wire.proof(self._token, wire.ADDON_LABEL, nonce, client.nonce_s, seen),
+            # Seconds of silence after which this add-on closes the connection (0: never),
+            # so a client can reconnect before it sends into a socket about to close.
+            "idle_timeout": self._idle_limit(),
         }
         self._queue(client, {"jsonrpc": "2.0", "result": result, "id": msg_id}, msg_id)
 
@@ -557,6 +572,7 @@ class MCPSocketServer:
             return
         client.authed = True
         client.deadline = 0.0
+        client.last_activity = self._now()
         self._queue(client, {"jsonrpc": "2.0", "result": {"ok": True}, "id": msg_id}, msg_id)
 
     @staticmethod
@@ -651,6 +667,8 @@ class MCPSocketServer:
             del client.wbuf[:sent]
             if sent:
                 client.last_progress = self._now()
+                if client.authed:
+                    client.last_activity = client.last_progress
 
     def _expire(self, client: _Client, now: float):
         """Apply the clocks: a closing client leaves at close_at, a stalled writer at WRITE_STALL.
@@ -673,6 +691,37 @@ class MCPSocketServer:
                     client.dead = True
         if client.wbuf and now - client.last_progress >= WRITE_STALL:
             client.dead = True
+            return
+        self._expire_idle(client, now)
+
+    def _idle_limit(self) -> float:
+        """The idle timeout in force, in seconds. 0 means none; a bad value means none too."""
+        try:
+            limit = float(self.idle_timeout)
+        except (TypeError, ValueError):
+            return 0
+        if not limit > 0 or limit == float("inf"):
+            return 0
+        return int(limit) if limit.is_integer() else limit
+
+    def _expire_idle(self, client: _Client, now: float):
+        """Close an authenticated client that has sent and taken nothing for idle_timeout.
+
+        A reply still waiting to leave is WRITE_STALL's business, not this. A handler that
+        runs long holds Blender's main thread, so no tick, and so no idle check, runs until
+        its reply is queued. The close is graceful: the peer sees EOF, and a Meshwire
+        client opens a new connection on its next call.
+        """
+        limit = self._idle_limit()
+        if not limit or not client.authed or client.closing or client.eof or client.wbuf:
+            return
+        idle = now - client.last_activity
+        if idle < limit:
+            return
+        print(f"MCP client idle for {idle:.0f}s (limit {limit:g}s): closing the connection")
+        client.rbuf.clear()  # a partial line that stopped arriving is not finished now
+        client.closing = True
+        client.close_at = now + CLOSE_GRACE
 
     def _drop(self, sock: socket.socket, client: _Client):
         client.wbuf.clear()
